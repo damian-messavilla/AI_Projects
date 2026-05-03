@@ -1,0 +1,653 @@
+"""
+GeoGuessr AI - Desktop-Anwendung
+================================
+Nimmt per Hotkey (Alt+X) einen Screenshot auf, sendet ihn an Google Gemini
+und zeigt die Analyse mit gerenderten Markdown in einer modernen GUI an.
+
+Benötigte Pakete (pip install):
+    pip install google-genai PyQt6 Pillow keyboard
+
+Autor: GeoGuessr AI Tool
+"""
+
+import sys
+import io
+import threading
+import base64
+import traceback
+import os
+import json
+
+def load_api_key(project_name):
+    key_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "api_keys.json")
+    try:
+        with open(key_file, "r", encoding="utf-8") as f:
+            return json.load(f).get(project_name, "")
+    except Exception:
+        return ""
+
+# --- Konfiguration -----------------------------------------------------------
+API_KEY = load_api_key("GeoguessrAI")
+MODEL_NAME = "gemini-3.1-flash-lite-preview"  # Modellname
+HOTKEY = "alt+x"  # Globaler Hotkey
+# ------------------------------------------------------------------------------
+
+# ── Drittanbieter-Imports ─────────────────────────────────────────────────────
+try:
+    from google import genai
+    from google.genai import types
+except ImportError:
+    print("FEHLER: 'google-genai' ist nicht installiert.")
+    print("Bitte installiere es mit:  pip install google-genai")
+    sys.exit(1)
+
+try:
+    from PyQt6.QtWidgets import (
+        QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+        QTextBrowser, QLabel, QFrame, QSplitter, QSystemTrayIcon, QMenu,
+        QSizePolicy, QProgressBar
+    )
+    from PyQt6.QtCore import Qt, pyqtSignal, QObject, QSize, QTimer
+    from PyQt6.QtGui import QPixmap, QImage, QIcon, QFont, QAction, QColor, QPalette
+except ImportError:
+    print("FEHLER: 'PyQt6' ist nicht installiert.")
+    print("Bitte installiere es mit:  pip install PyQt6")
+    sys.exit(1)
+
+try:
+    from PIL import ImageGrab, Image
+except ImportError:
+    print("FEHLER: 'Pillow' ist nicht installiert.")
+    print("Bitte installiere es mit:  pip install Pillow")
+    sys.exit(1)
+
+try:
+    import keyboard
+except ImportError:
+    print("FEHLER: 'keyboard' ist nicht installiert.")
+    print("Bitte installiere es mit:  pip install keyboard")
+    sys.exit(1)
+
+
+# ── GeoGuessr-Analyse-Prompt ─────────────────────────────────────────────────
+GEOGUESSR_PROMPT = """You are a world-class GeoGuessr expert and geolocation analyst.
+Analyze this screenshot from a GeoGuessr round and determine the most likely location.
+
+Examine the following clues systematically and report your findings for each visible category:
+
+### Architecture & Infrastructure
+- Building styles, materials, roof types, construction patterns
+- Road surface quality, lane markings, road width
+
+### Vegetation & Landscape
+- Types of trees, plants, crops visible
+- Terrain (flat, hilly, mountainous, coastal, desert)
+- Soil color and type
+
+### Road Signs & Text
+- Any visible text, language, script/alphabet
+- Road sign shapes, colors, and styles (European round, US rectangular, etc.)
+- Speed limit formats, distance markers, highway numbering systems
+
+### Utility Poles & Infrastructure
+- Pole material (wood, concrete, metal), style, and shape
+- Power line configurations
+- Street light designs
+
+### Bollards & Road Furniture
+- Bollard styles (these are highly country-specific!)
+- Guardrail types and colors
+- Road barrier designs
+
+### Vehicles & License Plates
+- License plate colors, shapes, and formats
+- Car brands and models common in specific regions
+- Driving side (left or right)
+
+### Weather & Sun Position
+- Cloud types, sky color, lighting angle
+- Sun position (helps determine hemisphere and latitude)
+- Season indicators
+
+### Google Coverage Meta-Clues
+- Camera quality and generation (Gen 2, 3, 4)
+- Car visible in bottom of screen (Google car type/color)
+- Coverage patterns and rift lines
+- Any compass or directional indicators
+
+### Final Verdict
+Based on ALL collected clues, provide:
+1. Country (with confidence percentage)
+2. Region/State (with confidence percentage)
+3. Specific City/Area (if determinable)
+4. Key deciding factors that led to your conclusion
+
+Be specific and decisive. Use ALL visible clues to narrow down the location as precisely as possible.
+Respond in English with well-structured Markdown formatting."""
+
+
+# ── Signal-Bridge (Thread → GUI) ─────────────────────────────────────────────
+class SignalBridge(QObject):
+    """Brücke zwischen Worker-Threads und dem Qt-GUI-Thread."""
+    result_ready = pyqtSignal(str)          # Markdown-Ergebnis
+    error_occurred = pyqtSignal(str)        # Fehlermeldung
+    screenshot_taken = pyqtSignal(object)   # PIL-Image des Screenshots
+    loading_started = pyqtSignal()          # Ladeanimation starten
+
+
+# ── Stylesheet ────────────────────────────────────────────────────────────────
+STYLESHEET = """
+QMainWindow {
+    background-color: #0d1117;
+}
+
+QWidget#centralWidget {
+    background-color: #0d1117;
+}
+
+QLabel#titleLabel {
+    color: #58a6ff;
+    font-size: 18px;
+    font-weight: bold;
+    padding: 8px 12px;
+}
+
+QLabel#statusLabel {
+    color: #8b949e;
+    font-size: 13px;
+    padding: 4px 12px;
+}
+
+QLabel#hotkeyLabel {
+    color: #f0883e;
+    font-size: 12px;
+    font-weight: bold;
+    background-color: #1c2128;
+    border: 1px solid #f0883e;
+    border-radius: 6px;
+    padding: 4px 10px;
+}
+
+QLabel#screenshotLabel {
+    background-color: #161b22;
+    border: 2px solid #21262d;
+    border-radius: 10px;
+    padding: 4px;
+}
+
+QTextBrowser#resultBrowser {
+    background-color: #161b22;
+    color: #c9d1d9;
+    border: 2px solid #21262d;
+    border-radius: 10px;
+    padding: 16px;
+    font-size: 14px;
+    selection-background-color: #264f78;
+}
+
+QFrame#headerFrame {
+    background-color: #161b22;
+    border-bottom: 1px solid #21262d;
+    padding: 8px;
+}
+
+QFrame#footerFrame {
+    background-color: #161b22;
+    border-top: 1px solid #21262d;
+    padding: 4px;
+}
+
+QProgressBar {
+    background-color: #21262d;
+    border: none;
+    border-radius: 4px;
+    height: 6px;
+    text-align: center;
+}
+
+QProgressBar::chunk {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 #58a6ff, stop:0.5 #bc8cff, stop:1 #58a6ff);
+    border-radius: 4px;
+}
+
+QSplitter::handle {
+    background-color: #21262d;
+    width: 2px;
+}
+"""
+
+# Markdown-CSS für den QTextBrowser
+MARKDOWN_CSS = """
+<style>
+    body {
+        font-family: 'Segoe UI', -apple-system, sans-serif;
+        color: #c9d1d9;
+        line-height: 1.7;
+        font-size: 14px;
+    }
+    h1 { color: #58a6ff; font-size: 22px; margin-top: 16px; margin-bottom: 8px;
+         border-bottom: 1px solid #21262d; padding-bottom: 6px; }
+    h2 { color: #58a6ff; font-size: 19px; margin-top: 14px; margin-bottom: 6px;
+         border-bottom: 1px solid #21262d; padding-bottom: 4px; }
+    h3 { color: #d2a8ff; font-size: 16px; margin-top: 12px; margin-bottom: 4px; }
+    h4 { color: #f0883e; font-size: 15px; margin-top: 10px; margin-bottom: 4px; }
+    strong, b { color: #f0f6fc; }
+    em, i { color: #8b949e; }
+    code {
+        background-color: #1c2128;
+        color: #f0883e;
+        padding: 2px 6px;
+        border-radius: 4px;
+        font-family: 'Cascadia Code', 'Consolas', monospace;
+        font-size: 13px;
+    }
+    pre {
+        background-color: #1c2128;
+        border: 1px solid #21262d;
+        border-radius: 6px;
+        padding: 12px;
+        font-family: 'Cascadia Code', 'Consolas', monospace;
+        font-size: 13px;
+        color: #c9d1d9;
+    }
+    ul, ol { margin-left: 8px; padding-left: 16px; }
+    li { margin-bottom: 4px; color: #c9d1d9; }
+    blockquote {
+        border-left: 3px solid #58a6ff;
+        margin-left: 0;
+        padding-left: 12px;
+        color: #8b949e;
+    }
+    hr {
+        border: none;
+        border-top: 1px solid #21262d;
+        margin: 12px 0;
+    }
+    a { color: #58a6ff; text-decoration: none; }
+    table { border-collapse: collapse; width: 100%; margin: 8px 0; }
+    th { background-color: #1c2128; color: #58a6ff; padding: 8px; text-align: left;
+         border: 1px solid #21262d; }
+    td { padding: 6px 8px; border: 1px solid #21262d; color: #c9d1d9; }
+</style>
+"""
+
+
+# ── Haupt-Fenster ─────────────────────────────────────────────────────────────
+class GeoGuessrWindow(QMainWindow):
+    """Hauptfenster der GeoGuessr-AI-Anwendung."""
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("🌍 GeoGuessr AI")
+        self.setMinimumSize(950, 650)
+        self.resize(1100, 750)
+        self.setStyleSheet(STYLESHEET)
+
+        # Signal-Bridge
+        self.bridge = SignalBridge()
+        self.bridge.result_ready.connect(self._on_result)
+        self.bridge.error_occurred.connect(self._on_error)
+        self.bridge.screenshot_taken.connect(self._on_screenshot)
+        self.bridge.loading_started.connect(self._on_loading)
+
+        # Gemini-Client
+        try:
+            self.client = genai.Client(api_key=API_KEY)
+        except Exception as e:
+            self.client = None
+            print(f"WARNUNG: Gemini-Client konnte nicht erstellt werden: {e}")
+
+        # UI aufbauen
+        self._build_ui()
+
+        # Globalen Hotkey registrieren
+        self._register_hotkey()
+
+        # Pulsierender Ladebalken-Timer
+        self._pulse_timer = QTimer()
+        self._pulse_timer.timeout.connect(self._pulse_progress)
+        self._pulse_value = 0
+        self._pulse_direction = 1
+
+    # ── UI-Aufbau ─────────────────────────────────────────────────────────────
+    def _build_ui(self):
+        central = QWidget()
+        central.setObjectName("centralWidget")
+        self.setCentralWidget(central)
+        main_layout = QVBoxLayout(central)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+
+        # ── Header ───────────────────────────────────────────────────────────
+        header = QFrame()
+        header.setObjectName("headerFrame")
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(16, 10, 16, 10)
+
+        title = QLabel("🌍  GeoGuessr AI  Analyzer")
+        title.setObjectName("titleLabel")
+        header_layout.addWidget(title)
+
+        header_layout.addStretch()
+
+        hotkey_label = QLabel(f"⌨  Hotkey:  {HOTKEY.upper()}")
+        hotkey_label.setObjectName("hotkeyLabel")
+        header_layout.addWidget(hotkey_label)
+
+        main_layout.addWidget(header)
+
+        # ── Ladebalken ───────────────────────────────────────────────────────
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setFixedHeight(4)
+        self.progress_bar.setVisible(False)
+        main_layout.addWidget(self.progress_bar)
+
+        # ── Content-Bereich (Splitter) ───────────────────────────────────────
+        content_widget = QWidget()
+        content_layout = QHBoxLayout(content_widget)
+        content_layout.setContentsMargins(16, 12, 16, 12)
+        content_layout.setSpacing(12)
+
+        # Linke Seite: Screenshot-Vorschau
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(8)
+
+        screenshot_title = QLabel("📸  Screenshot")
+        screenshot_title.setStyleSheet("color: #8b949e; font-size: 12px; font-weight: bold;")
+        left_layout.addWidget(screenshot_title)
+
+        self.screenshot_label = QLabel("Drücke ALT+X um\neinen Screenshot\naufzunehmen")
+        self.screenshot_label.setObjectName("screenshotLabel")
+        self.screenshot_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.screenshot_label.setMinimumSize(320, 200)
+        self.screenshot_label.setMaximumWidth(400)
+        self.screenshot_label.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding
+        )
+        self.screenshot_label.setStyleSheet(
+            self.screenshot_label.styleSheet() + "color: #484f58; font-size: 13px;"
+        )
+        left_layout.addWidget(self.screenshot_label)
+
+        # Statusanzeige unter dem Screenshot
+        self.status_label = QLabel("⏳  Bereit – warte auf Hotkey...")
+        self.status_label.setObjectName("statusLabel")
+        left_layout.addWidget(self.status_label)
+
+        content_layout.addWidget(left_panel)
+
+        # Rechte Seite: Markdown-Ergebnis
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(8)
+
+        result_title = QLabel("🤖  AI-Analyse")
+        result_title.setStyleSheet("color: #8b949e; font-size: 12px; font-weight: bold;")
+        right_layout.addWidget(result_title)
+
+        self.result_browser = QTextBrowser()
+        self.result_browser.setObjectName("resultBrowser")
+        self.result_browser.setOpenExternalLinks(True)
+        self.result_browser.setPlaceholderText(
+            "Die Analyse wird hier angezeigt, nachdem ein Screenshot aufgenommen wurde..."
+        )
+        right_layout.addWidget(self.result_browser)
+
+        content_layout.addWidget(right_panel, stretch=2)
+        main_layout.addWidget(content_widget, stretch=1)
+
+        # ── Footer ───────────────────────────────────────────────────────────
+        footer = QFrame()
+        footer.setObjectName("footerFrame")
+        footer_layout = QHBoxLayout(footer)
+        footer_layout.setContentsMargins(16, 6, 16, 6)
+
+        model_label = QLabel(f"Modell: {MODEL_NAME}")
+        model_label.setStyleSheet("color: #484f58; font-size: 11px;")
+        footer_layout.addWidget(model_label)
+
+        footer_layout.addStretch()
+
+        credits_label = QLabel("GeoGuessr AI Analyzer v1.0")
+        credits_label.setStyleSheet("color: #484f58; font-size: 11px;")
+        footer_layout.addWidget(credits_label)
+
+        main_layout.addWidget(footer)
+
+    # ── Hotkey-Registrierung ──────────────────────────────────────────────────
+    def _register_hotkey(self):
+        """Registriert den globalen Hotkey in einem separaten Thread."""
+        try:
+            keyboard.add_hotkey(HOTKEY, self._on_hotkey_pressed)
+            print(f"[INFO] Globaler Hotkey '{HOTKEY.upper()}' registriert.")
+        except Exception as e:
+            print(f"[FEHLER] Hotkey konnte nicht registriert werden: {e}")
+            self.status_label.setText(f"⚠️  Hotkey-Fehler: {e}")
+
+    # ── Hotkey-Callback ───────────────────────────────────────────────────────
+    def _on_hotkey_pressed(self):
+        """Wird aufgerufen, wenn der Hotkey gedrückt wird (läuft im keyboard-Thread)."""
+        # Signale aus dem Thread heraus senden → GUI-Thread
+        self.bridge.loading_started.emit()
+        threading.Thread(target=self._capture_and_analyze, daemon=True).start()
+
+    # ── Screenshot + API-Aufruf ───────────────────────────────────────────────
+    def _capture_and_analyze(self):
+        """Nimmt einen Screenshot auf und sendet ihn an die Gemini-API."""
+        try:
+            # Screenshot aufnehmen
+            screenshot: Image.Image = ImageGrab.grab()
+            self.bridge.screenshot_taken.emit(screenshot)
+
+            if self.client is None:
+                self.bridge.error_occurred.emit(
+                    "❌ Gemini-Client nicht initialisiert.\n\n"
+                    "Bitte setze einen gültigen API-Key in der Variable `API_KEY`."
+                )
+                return
+
+            # Bild für die API vorbereiten (als JPEG komprimieren)
+            img_buffer = io.BytesIO()
+            screenshot.save(img_buffer, format="JPEG", quality=85)
+            img_bytes = img_buffer.getvalue()
+
+            # Bild als Part für die API erstellen
+            image_part = {
+                "inline_data": {
+                    "mime_type": "image/jpeg",
+                    "data": base64.b64encode(img_bytes).decode("utf-8")
+                }
+            }
+
+            # API-Aufruf
+            response = self.client.models.generate_content(
+                model=MODEL_NAME,
+                contents=[image_part, GEOGUESSR_PROMPT],
+                config=types.GenerateContentConfig(
+                    thinking_config=types.ThinkingConfig(
+                        thinking_level="HIGH"  # Lässt die KI sehr intensiv und lange nachdenken (MINIMAL, LOW, MEDIUM, HIGH)
+                    ),
+                    temperature=1  # Zusätzlich: Weniger raten, mehr analysieren
+                )
+            )
+
+            # Ergebnis extrahieren
+            if response and response.text:
+                self.bridge.result_ready.emit(response.text)
+            else:
+                self.bridge.error_occurred.emit(
+                    "⚠️ Die API hat eine leere Antwort zurückgegeben.\n\n"
+                    "Versuche es erneut mit einem anderen Screenshot."
+                )
+
+        except Exception as e:
+            error_msg = (
+                f"❌ **Fehler bei der Analyse:**\n\n"
+                f"`{type(e).__name__}`: {str(e)}\n\n"
+                f"```\n{traceback.format_exc()}\n```"
+            )
+            self.bridge.error_occurred.emit(error_msg)
+
+    # ── GUI-Slot: Laden gestartet ─────────────────────────────────────────────
+    def _on_loading(self):
+        """Wird im GUI-Thread aufgerufen, wenn die Analyse startet."""
+        self.showNormal()
+        self.activateWindow()
+        self.raise_()
+
+        self.status_label.setText("🔄  Screenshot aufgenommen – Analyse läuft...")
+        self.status_label.setStyleSheet("color: #58a6ff; font-size: 13px; padding: 4px 12px;")
+
+        # Ladebalken anzeigen
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self._pulse_value = 0
+        self._pulse_direction = 1
+        self._pulse_timer.start(30)
+
+        # Lade-Text in den Browser setzen
+        loading_html = f"""
+        {MARKDOWN_CSS}
+        <div style="text-align: center; padding: 60px 20px;">
+            <h2 style="color: #58a6ff;">🔍 Analysiere Screenshot...</h2>
+            <p style="color: #8b949e; font-size: 15px;">
+                Das Bild wird an Gemini gesendet.<br>
+                Bitte warte einen Moment...
+            </p>
+        </div>
+        """
+        self.result_browser.setHtml(loading_html)
+
+    # ── GUI-Slot: Screenshot empfangen ────────────────────────────────────────
+    def _on_screenshot(self, pil_image: Image.Image):
+        """Zeigt den Screenshot als Vorschau in der GUI an."""
+        try:
+            # PIL → QPixmap
+            img_buffer = io.BytesIO()
+            pil_image.save(img_buffer, format="PNG")
+            img_data = img_buffer.getvalue()
+
+            qimage = QImage()
+            qimage.loadFromData(img_data)
+            pixmap = QPixmap.fromImage(qimage)
+
+            # Skalieren auf die Label-Größe
+            scaled = pixmap.scaled(
+                self.screenshot_label.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+            )
+            self.screenshot_label.setPixmap(scaled)
+        except Exception as e:
+            print(f"[WARNUNG] Screenshot-Vorschau fehlgeschlagen: {e}")
+
+    # ── GUI-Slot: Ergebnis empfangen ──────────────────────────────────────────
+    def _on_result(self, markdown_text: str):
+        """Rendert das Markdown-Ergebnis in der GUI."""
+        self._pulse_timer.stop()
+        self.progress_bar.setVisible(False)
+
+        self.status_label.setText("✅  Analyse abgeschlossen!")
+        self.status_label.setStyleSheet("color: #3fb950; font-size: 13px; padding: 4px 12px;")
+
+        # Markdown mit CSS rendern
+        html_content = f"{MARKDOWN_CSS}<body>{self._markdown_to_html(markdown_text)}</body>"
+        self.result_browser.setHtml(html_content)
+
+    # ── GUI-Slot: Fehler empfangen ────────────────────────────────────────────
+    def _on_error(self, error_text: str):
+        """Zeigt eine Fehlermeldung in der GUI an."""
+        self._pulse_timer.stop()
+        self.progress_bar.setVisible(False)
+
+        self.status_label.setText("❌  Fehler aufgetreten!")
+        self.status_label.setStyleSheet("color: #f85149; font-size: 13px; padding: 4px 12px;")
+
+        error_html = f"""
+        {MARKDOWN_CSS}
+        <div style="padding: 20px;">
+            <div style="background-color: #3d1f1f; border: 1px solid #f85149;
+                        border-radius: 8px; padding: 16px; margin: 8px 0;">
+                {self._markdown_to_html(error_text)}
+            </div>
+        </div>
+        """
+        self.result_browser.setHtml(error_html)
+
+    # ── Markdown → HTML Konvertierung ─────────────────────────────────────────
+    def _markdown_to_html(self, md: str) -> str:
+        """Konvertiert Markdown in HTML. Nutzt QTextBrowser.setMarkdown() intern
+        oder eine einfache manuelle Konvertierung als Fallback."""
+        try:
+            # Verwende einen temporären QTextBrowser für die Konvertierung
+            temp = QTextBrowser()
+            temp.setMarkdown(md)
+            return temp.toHtml()
+        except Exception:
+            # Fallback: einfaches Escaping
+            return f"<pre>{md}</pre>"
+
+    # ── Pulsierender Ladebalken ───────────────────────────────────────────────
+    def _pulse_progress(self):
+        """Animiert den Ladebalken hin und her."""
+        self._pulse_value += self._pulse_direction * 2
+        if self._pulse_value >= 100:
+            self._pulse_direction = -1
+        elif self._pulse_value <= 0:
+            self._pulse_direction = 1
+        self.progress_bar.setValue(self._pulse_value)
+
+    # ── Fenster-Schließen ─────────────────────────────────────────────────────
+    def closeEvent(self, event):
+        """Räumt auf beim Schließen."""
+        try:
+            keyboard.unhook_all()
+        except Exception:
+            pass
+        event.accept()
+
+
+# ── Hauptprogramm ─────────────────────────────────────────────────────────────
+def main():
+    import os
+    # Qt-Monitor-Warnung unter Windows unterdrücken (harmlos)
+    os.environ["QT_LOGGING_RULES"] = "qt.qpa.screen=false"
+
+    # High-DPI-Unterstützung
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+
+    # Dunkle Palette setzen (Fusion + Dark)
+    palette = QPalette()
+    palette.setColor(QPalette.ColorRole.Window, QColor("#0d1117"))
+    palette.setColor(QPalette.ColorRole.WindowText, QColor("#c9d1d9"))
+    palette.setColor(QPalette.ColorRole.Base, QColor("#161b22"))
+    palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#1c2128"))
+    palette.setColor(QPalette.ColorRole.Text, QColor("#c9d1d9"))
+    palette.setColor(QPalette.ColorRole.Button, QColor("#21262d"))
+    palette.setColor(QPalette.ColorRole.ButtonText, QColor("#c9d1d9"))
+    palette.setColor(QPalette.ColorRole.Highlight, QColor("#58a6ff"))
+    palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
+    app.setPalette(palette)
+
+    window = GeoGuessrWindow()
+    window.show()
+
+    print("=" * 60)
+    print("    GeoGuessr AI Analyzer gestartet!")
+    print(f"     Drücke {HOTKEY.upper()} für Screenshot + Analyse")
+    print(f"    Modell: {MODEL_NAME}")
+    print("=" * 60)
+
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
