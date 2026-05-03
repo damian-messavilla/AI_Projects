@@ -517,7 +517,7 @@ class ExerciseAIWindow(QMainWindow):
         if self.cb_explain.isChecked(): actions.append("Erklären")
         if self.cb_solve.isChecked(): actions.append("Aufgabe Schritt-für-Schritt lösen")
         if self.cb_check_errors.isChecked(): actions.append("Code/Text auf Fehler prüfen")
-        if self.cb_translate.isChecked(): actions.append("Übersetzen (Englisch <-> Deutsch)")
+        if self.cb_translate.isChecked(): actions.append("Übersetzen (zu Deutsch)")
         
         if not actions:
             actions = ["Bitte analysiere das Bild."]
@@ -530,7 +530,7 @@ class ExerciseAIWindow(QMainWindow):
         if custom:
             prompt += f"\nZusätzliche Anweisung: {custom}\n"
             
-        prompt += "\nVerwende zwingend sauberes Markdown und LaTeX für mathematische Formeln. Formeln müssen in $$ (für Blöcke) oder $ (inline) stehen."
+        #prompt += "\nVerwende zwingend sauberes Markdown und LaTeX für mathematische Formeln. Formeln müssen in $$ (für Blöcke) oder $ (inline) stehen."
         return prompt
 
     def _on_send_clicked(self):
