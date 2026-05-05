@@ -1,7 +1,7 @@
 Set objShell = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 strPath = fso.GetParentFolderName(WScript.ScriptFullName)
-strPythonW = "C:\Users\damian\AppData\Local\Programs\Python\Python311\pythonw.exe"
+strPythonW = "pythonw"
 strScript = strPath & "\exercise_ai.py"
 
 objShell.CurrentDirectory = strPath
