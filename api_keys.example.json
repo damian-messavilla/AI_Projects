@@ -1,4 +1,5 @@
 {
   "GeoguessrAI": "YOUR_GEMINI_API_KEY_HERE",
-  "ExerciseAI": "YOUR_GEMINI_API_KEY_HERE"
+  "ExerciseAI": "YOUR_GEMINI_API_KEY_HERE",
+  "MistralAI": "YOUR_MISTRAL_API_KEY_HERE"
 }

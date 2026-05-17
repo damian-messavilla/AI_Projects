@@ -28,7 +28,9 @@ def load_api_key(project_name):
 
 # --- Konfiguration -----------------------------------------------------------
 API_KEY = load_api_key("GeoguessrAI")
+MISTRAL_API_KEY = load_api_key("MistralAI")
 MODEL_NAME = "gemini-3.1-flash-lite-preview"  # Modellname
+MISTRAL_MODEL_NAME = "mistral-large-2512"
 HOTKEY = "alt+x"  # Globaler Hotkey
 # ------------------------------------------------------------------------------
 
@@ -42,10 +44,17 @@ except ImportError:
     sys.exit(1)
 
 try:
+    from mistralai import Mistral
+except ImportError:
+    print("FEHLER: 'mistralai' ist nicht installiert.")
+    print("Bitte installiere es mit:  pip install mistralai")
+    sys.exit(1)
+
+try:
     from PyQt6.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
         QTextBrowser, QLabel, QFrame, QSplitter, QSystemTrayIcon, QMenu,
-        QSizePolicy, QProgressBar
+        QSizePolicy, QProgressBar, QTabWidget
     )
     from PyQt6.QtCore import Qt, pyqtSignal, QObject, QSize, QTimer
     from PyQt6.QtGui import QPixmap, QImage, QIcon, QFont, QAction, QColor, QPalette
@@ -129,8 +138,8 @@ Respond in English with well-structured Markdown formatting."""
 # ── Signal-Bridge (Thread → GUI) ─────────────────────────────────────────────
 class SignalBridge(QObject):
     """Brücke zwischen Worker-Threads und dem Qt-GUI-Thread."""
-    result_ready = pyqtSignal(str)          # Markdown-Ergebnis
-    error_occurred = pyqtSignal(str)        # Fehlermeldung
+    result_ready = pyqtSignal(str, str)          # AI-Name, Markdown-Ergebnis
+    error_occurred = pyqtSignal(str, str)        # AI-Name, Fehlermeldung
     screenshot_taken = pyqtSignal(object)   # PIL-Image des Screenshots
     loading_started = pyqtSignal()          # Ladeanimation starten
 
@@ -215,6 +224,30 @@ QSplitter::handle {
     background-color: #21262d;
     width: 2px;
 }
+
+QTabWidget::pane {
+    border: 1px solid #21262d;
+    border-radius: 8px;
+    background: #161b22;
+}
+
+QTabBar::tab {
+    background: #0d1117;
+    color: #8b949e;
+    padding: 8px 24px;
+    border: 1px solid #21262d;
+    border-bottom: none;
+    border-top-left-radius: 6px;
+    border-top-right-radius: 6px;
+    margin-right: 2px;
+    font-weight: bold;
+}
+
+QTabBar::tab:selected {
+    background: #161b22;
+    color: #58a6ff;
+    border-top: 2px solid #58a6ff;
+}
 """
 
 # Markdown-CSS für den QTextBrowser
@@ -298,6 +331,18 @@ class GeoGuessrWindow(QMainWindow):
             self.client = None
             print(f"WARNUNG: Gemini-Client konnte nicht erstellt werden: {e}")
 
+        # Mistral-Client
+        try:
+            if not MISTRAL_API_KEY:
+                raise ValueError("Mistral API-Key fehlt.")
+            self.mistral_client = Mistral(api_key=MISTRAL_API_KEY)
+        except Exception as e:
+            self.mistral_client = None
+            print(f"WARNUNG: Mistral-Client konnte nicht erstellt werden: {e}")
+
+        # Status tracking
+        self.ai_status = {"Gemini": "idle", "Mistral": "idle"}
+        
         # UI aufbauen
         self._build_ui()
 
@@ -392,13 +437,21 @@ class GeoGuessrWindow(QMainWindow):
         result_title.setStyleSheet("color: #8b949e; font-size: 12px; font-weight: bold;")
         right_layout.addWidget(result_title)
 
-        self.result_browser = QTextBrowser()
-        self.result_browser.setObjectName("resultBrowser")
-        self.result_browser.setOpenExternalLinks(True)
-        self.result_browser.setPlaceholderText(
-            "Die Analyse wird hier angezeigt, nachdem ein Screenshot aufgenommen wurde..."
-        )
-        right_layout.addWidget(self.result_browser)
+        self.result_tabs = QTabWidget()
+        self.result_tabs.setObjectName("resultTabs")
+        
+        self.gemini_browser = QTextBrowser()
+        self.gemini_browser.setOpenExternalLinks(True)
+        self.gemini_browser.setPlaceholderText("Die Analyse wird hier angezeigt...")
+        
+        self.mistral_browser = QTextBrowser()
+        self.mistral_browser.setOpenExternalLinks(True)
+        self.mistral_browser.setPlaceholderText("Die Analyse wird hier angezeigt...")
+
+        self.result_tabs.addTab(self.gemini_browser, "Gemini 3.1")
+        self.result_tabs.addTab(self.mistral_browser, "Mistral Large")
+        
+        right_layout.addWidget(self.result_tabs)
 
         content_layout.addWidget(right_panel, stretch=2)
         main_layout.addWidget(content_widget, stretch=1)
@@ -440,60 +493,81 @@ class GeoGuessrWindow(QMainWindow):
 
     # ── Screenshot + API-Aufruf ───────────────────────────────────────────────
     def _capture_and_analyze(self):
-        """Nimmt einen Screenshot auf und sendet ihn an die Gemini-API."""
+        """Nimmt einen Screenshot auf und sendet ihn parallel an die APIs."""
         try:
-            # Screenshot aufnehmen
             screenshot: Image.Image = ImageGrab.grab()
             self.bridge.screenshot_taken.emit(screenshot)
 
-            if self.client is None:
-                self.bridge.error_occurred.emit(
-                    "❌ Gemini-Client nicht initialisiert.\n\n"
-                    "Bitte setze einen gültigen API-Key in der Variable `API_KEY`."
-                )
-                return
-
-            # Bild für die API vorbereiten (als JPEG komprimieren)
+            # Bild für die API vorbereiten
             img_buffer = io.BytesIO()
             screenshot.save(img_buffer, format="JPEG", quality=85)
             img_bytes = img_buffer.getvalue()
+            base64_img = base64.b64encode(img_bytes).decode("utf-8")
 
-            # Bild als Part für die API erstellen
-            image_part = {
-                "inline_data": {
-                    "mime_type": "image/jpeg",
-                    "data": base64.b64encode(img_bytes).decode("utf-8")
-                }
-            }
+            if self.client:
+                threading.Thread(target=self._analyze_gemini, args=(img_bytes,), daemon=True).start()
+            else:
+                self.bridge.error_occurred.emit("Gemini", "❌ Gemini-Client nicht initialisiert.")
+                
+            if self.mistral_client:
+                threading.Thread(target=self._analyze_mistral, args=(base64_img,), daemon=True).start()
+            else:
+                self.bridge.error_occurred.emit("Mistral", "❌ Mistral-Client nicht initialisiert.")
 
-            # API-Aufruf
+        except Exception as e:
+            error_msg = f"❌ **Fehler bei der Aufnahme:**\n\n`{type(e).__name__}`: {str(e)}\n\n```\n{traceback.format_exc()}\n```"
+            self.bridge.error_occurred.emit("System", error_msg)
+
+    def _analyze_gemini(self, img_bytes):
+        try:
+            image_part = {"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(img_bytes).decode("utf-8")}}
             response = self.client.models.generate_content(
                 model=MODEL_NAME,
                 contents=[image_part, GEOGUESSR_PROMPT],
                 config=types.GenerateContentConfig(
-                    thinking_config=types.ThinkingConfig(
-                        thinking_level="HIGH"  # Lässt die KI sehr intensiv und lange nachdenken (MINIMAL, LOW, MEDIUM, HIGH)
-                    ),
-                    temperature=1  # Zusätzlich: Weniger raten, mehr analysieren
+                    thinking_config=types.ThinkingConfig(thinking_level="HIGH"),
+                    temperature=1
                 )
             )
-
-            # Ergebnis extrahieren
             if response and response.text:
-                self.bridge.result_ready.emit(response.text)
+                self.bridge.result_ready.emit("Gemini", response.text)
             else:
-                self.bridge.error_occurred.emit(
-                    "⚠️ Die API hat eine leere Antwort zurückgegeben.\n\n"
-                    "Versuche es erneut mit einem anderen Screenshot."
-                )
-
+                self.bridge.error_occurred.emit("Gemini", "⚠️ Leere Antwort zurückgegeben.")
         except Exception as e:
-            error_msg = (
-                f"❌ **Fehler bei der Analyse:**\n\n"
-                f"`{type(e).__name__}`: {str(e)}\n\n"
-                f"```\n{traceback.format_exc()}\n```"
+            self.bridge.error_occurred.emit("Gemini", f"❌ Fehler:\n\n`{type(e).__name__}`: {str(e)}\n\n```\n{traceback.format_exc()}\n```")
+
+    def _analyze_mistral(self, base64_image):
+        try:
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": GEOGUESSR_PROMPT},
+                        {"type": "image_url", "image_url": f"data:image/jpeg;base64,{base64_image}"}
+                    ]
+                }
+            ]
+            response = self.mistral_client.chat.complete(
+                model=MISTRAL_MODEL_NAME,
+                messages=messages
             )
-            self.bridge.error_occurred.emit(error_msg)
+            if response and response.choices and response.choices[0].message.content:
+                self.bridge.result_ready.emit("Mistral", response.choices[0].message.content)
+            else:
+                self.bridge.error_occurred.emit("Mistral", "⚠️ Leere Antwort zurückgegeben.")
+        except Exception as e:
+            self.bridge.error_occurred.emit("Mistral", f"❌ Fehler:\n\n`{type(e).__name__}`: {str(e)}\n\n```\n{traceback.format_exc()}\n```")
+
+    def _check_all_done(self):
+        if self.ai_status["Gemini"] in ("done", "error") and self.ai_status["Mistral"] in ("done", "error"):
+            self._pulse_timer.stop()
+            self.progress_bar.setVisible(False)
+            if self.ai_status["Gemini"] == "error" and self.ai_status["Mistral"] == "error":
+                self.status_label.setText("❌  Fehler aufgetreten!")
+                self.status_label.setStyleSheet("color: #f85149; font-size: 13px; padding: 4px 12px;")
+            else:
+                self.status_label.setText("✅  Analyse abgeschlossen!")
+                self.status_label.setStyleSheet("color: #3fb950; font-size: 13px; padding: 4px 12px;")
 
     # ── GUI-Slot: Laden gestartet ─────────────────────────────────────────────
     def _on_loading(self):
@@ -504,6 +578,10 @@ class GeoGuessrWindow(QMainWindow):
 
         self.status_label.setText("🔄  Screenshot aufgenommen – Analyse läuft...")
         self.status_label.setStyleSheet("color: #58a6ff; font-size: 13px; padding: 4px 12px;")
+
+        self.ai_status = {"Gemini": "loading", "Mistral": "loading"}
+        self.result_tabs.setTabText(0, "Gemini (Lädt... ⏳)")
+        self.result_tabs.setTabText(1, "Mistral (Lädt... ⏳)")
 
         # Ladebalken anzeigen
         self.progress_bar.setVisible(True)
@@ -518,12 +596,13 @@ class GeoGuessrWindow(QMainWindow):
         <div style="text-align: center; padding: 60px 20px;">
             <h2 style="color: #58a6ff;">🔍 Analysiere Screenshot...</h2>
             <p style="color: #8b949e; font-size: 15px;">
-                Das Bild wird an Gemini gesendet.<br>
+                Das Bild wird an die KIs gesendet.<br>
                 Bitte warte einen Moment...
             </p>
         </div>
         """
-        self.result_browser.setHtml(loading_html)
+        self.gemini_browser.setHtml(loading_html)
+        self.mistral_browser.setHtml(loading_html)
 
     # ── GUI-Slot: Screenshot empfangen ────────────────────────────────────────
     def _on_screenshot(self, pil_image: Image.Image):
@@ -549,26 +628,26 @@ class GeoGuessrWindow(QMainWindow):
             print(f"[WARNUNG] Screenshot-Vorschau fehlgeschlagen: {e}")
 
     # ── GUI-Slot: Ergebnis empfangen ──────────────────────────────────────────
-    def _on_result(self, markdown_text: str):
+    def _on_result(self, ai_name: str, markdown_text: str):
         """Rendert das Markdown-Ergebnis in der GUI."""
-        self._pulse_timer.stop()
-        self.progress_bar.setVisible(False)
-
-        self.status_label.setText("✅  Analyse abgeschlossen!")
-        self.status_label.setStyleSheet("color: #3fb950; font-size: 13px; padding: 4px 12px;")
+        self.ai_status[ai_name] = "done"
 
         # Markdown mit CSS rendern
         html_content = f"{MARKDOWN_CSS}<body>{self._markdown_to_html(markdown_text)}</body>"
-        self.result_browser.setHtml(html_content)
+        
+        if ai_name == "Gemini":
+            self.gemini_browser.setHtml(html_content)
+            self.result_tabs.setTabText(0, "Gemini 3.1 ✅")
+        elif ai_name == "Mistral":
+            self.mistral_browser.setHtml(html_content)
+            self.result_tabs.setTabText(1, "Mistral Large ✅")
+
+        self._check_all_done()
 
     # ── GUI-Slot: Fehler empfangen ────────────────────────────────────────────
-    def _on_error(self, error_text: str):
+    def _on_error(self, ai_name: str, error_text: str):
         """Zeigt eine Fehlermeldung in der GUI an."""
-        self._pulse_timer.stop()
-        self.progress_bar.setVisible(False)
-
-        self.status_label.setText("❌  Fehler aufgetreten!")
-        self.status_label.setStyleSheet("color: #f85149; font-size: 13px; padding: 4px 12px;")
+        self.ai_status[ai_name] = "error"
 
         error_html = f"""
         {MARKDOWN_CSS}
@@ -579,7 +658,20 @@ class GeoGuessrWindow(QMainWindow):
             </div>
         </div>
         """
-        self.result_browser.setHtml(error_html)
+        
+        if ai_name == "Gemini":
+            self.gemini_browser.setHtml(error_html)
+            self.result_tabs.setTabText(0, "Gemini 3.1 ❌")
+        elif ai_name == "Mistral":
+            self.mistral_browser.setHtml(error_html)
+            self.result_tabs.setTabText(1, "Mistral Large ❌")
+        else: # System-Fehler an beide übergeben
+            self.gemini_browser.setHtml(error_html)
+            self.mistral_browser.setHtml(error_html)
+            self.ai_status["Gemini"] = "error"
+            self.ai_status["Mistral"] = "error"
+
+        self._check_all_done()
 
     # ── Markdown → HTML Konvertierung ─────────────────────────────────────────
     def _markdown_to_html(self, md: str) -> str:
