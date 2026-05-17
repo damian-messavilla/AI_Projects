@@ -44,7 +44,7 @@ except ImportError:
     sys.exit(1)
 
 try:
-    from mistralai import Mistral
+    from mistralai.client import Mistral
 except ImportError:
     print("FEHLER: 'mistralai' ist nicht installiert.")
     print("Bitte installiere es mit:  pip install mistralai")
