@@ -17,6 +17,7 @@ import base64
 import traceback
 import os
 import json
+import re
 
 def load_api_key(project_name):
     key_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "api_keys.json")
@@ -54,7 +55,7 @@ try:
     from PyQt6.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
         QTextBrowser, QLabel, QFrame, QSplitter, QSystemTrayIcon, QMenu,
-        QSizePolicy, QProgressBar, QTabWidget
+        QSizePolicy, QProgressBar, QTabWidget, QPushButton
     )
     from PyQt6.QtCore import Qt, pyqtSignal, QObject, QSize, QTimer
     from PyQt6.QtGui import QPixmap, QImage, QIcon, QFont, QAction, QColor, QPalette
@@ -125,11 +126,20 @@ Examine the following clues systematically and report your findings for each vis
 - Any compass or directional indicators
 
 ### Final Verdict
-Based on ALL collected clues, provide:
-1. Country (with confidence percentage)
-2. Region/State (with confidence percentage)
-3. Specific City/Area (if determinable)
-4. Key deciding factors that led to your conclusion
+Write your full analysis as usual to maintain your reasoning process. However, you MUST wrap your final conclusion inside exactly these tags: <FINAL_VERDICT> and </FINAL_VERDICT>.
+Inside these tags, provide ONLY the following points formatted EXACTLY like this:
+**1. Country:** [Country Name] ([Confidence]%)
+
+**2. Region/State:** [Region Name] ([Confidence]%)
+
+**3. Specific City/Area:** [City Name]
+
+**4. Key Deciding Factors:**
+- [Factor 1]
+- [Factor 2]
+- [Factor 3]
+
+You MUST ignore all GeoGuessr game UI elements (e.g., text like "Raten", "Hinweis", "Punkte", compass, minimap). This UI is in German simply because the user plays the game in German. It has NOTHING to do with the actual location of the image! Focus strictly on the street view environment.
 
 Be specific and decisive. Use ALL visible clues to narrow down the location as precisely as possible.
 Respond in English with well-structured Markdown formatting."""
@@ -316,6 +326,9 @@ class GeoGuessrWindow(QMainWindow):
         self.setMinimumSize(950, 650)
         self.resize(1100, 750)
         self.setStyleSheet(STYLESHEET)
+        
+        self.full_responses = {"Gemini": "", "Mistral": ""}
+        self.verdicts = {"Gemini": "", "Mistral": ""}
 
         # Signal-Bridge
         self.bridge = SignalBridge()
@@ -433,9 +446,40 @@ class GeoGuessrWindow(QMainWindow):
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(8)
 
+        right_header = QHBoxLayout()
         result_title = QLabel("🤖  AI-Analyse")
         result_title.setStyleSheet("color: #8b949e; font-size: 12px; font-weight: bold;")
-        right_layout.addWidget(result_title)
+        right_header.addWidget(result_title)
+        
+        right_header.addStretch()
+        
+        self.toggle_details_btn = QPushButton("Details")
+        self.toggle_details_btn.setObjectName("toggleDetailsBtn")
+        self.toggle_details_btn.setCheckable(True)
+        self.toggle_details_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #21262d;
+                color: #c9d1d9;
+                border: 1px solid #30363d;
+                border-radius: 4px;
+                padding: 4px 12px;
+                font-size: 11px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #30363d;
+                border: 1px solid #8b949e;
+            }
+            QPushButton:checked {
+                background-color: #1f6feb;
+                color: #ffffff;
+                border: 1px solid #1f6feb;
+            }
+        """)
+        self.toggle_details_btn.clicked.connect(self._toggle_details)
+        right_header.addWidget(self.toggle_details_btn)
+        
+        right_layout.addLayout(right_header)
 
         self.result_tabs = QTabWidget()
         self.result_tabs.setObjectName("resultTabs")
@@ -627,22 +671,63 @@ class GeoGuessrWindow(QMainWindow):
         except Exception as e:
             print(f"[WARNUNG] Screenshot-Vorschau fehlgeschlagen: {e}")
 
+    def _extract_final_verdict(self, text: str) -> str:
+        """Extrahiert den Text innerhalb von <FINAL_VERDICT>...</FINAL_VERDICT>.
+        Greift auf alles nach 'Final Verdict' zurück oder den gesamten Text, falls die Tags fehlen."""
+        match = re.search(r"<FINAL_VERDICT>(.*?)</FINAL_VERDICT>", text, re.DOTALL | re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+            
+        # Fallback 1: Suche nach Überschrift "Final Verdict"
+        match_fallback = re.search(r"(#*\s*Final Verdict.*?)(?:\Z)", text, re.DOTALL | re.IGNORECASE)
+        if match_fallback:
+            return match_fallback.group(1).strip()
+            
+        # Fallback 2: Gib den gesamten Text zurück
+        return text
+
     # ── GUI-Slot: Ergebnis empfangen ──────────────────────────────────────────
     def _on_result(self, ai_name: str, markdown_text: str):
         """Rendert das Markdown-Ergebnis in der GUI."""
         self.ai_status[ai_name] = "done"
 
-        # Markdown mit CSS rendern
-        html_content = f"{MARKDOWN_CSS}<body>{self._markdown_to_html(markdown_text)}</body>"
+        # Extrahiere nur den Final Verdict und speichere beide Versionen
+        final_verdict_text = self._extract_final_verdict(markdown_text)
+        
+        if ai_name in ["Gemini", "Mistral"]:
+            self.full_responses[ai_name] = markdown_text
+            self.verdicts[ai_name] = final_verdict_text
+            
+        self._update_browser_content(ai_name)
         
         if ai_name == "Gemini":
-            self.gemini_browser.setHtml(html_content)
             self.result_tabs.setTabText(0, "Gemini 3.1 ✅")
         elif ai_name == "Mistral":
-            self.mistral_browser.setHtml(html_content)
             self.result_tabs.setTabText(1, "Mistral Large ✅")
-
+        
         self._check_all_done()
+
+    def _update_browser_content(self, ai_name: str):
+        """Aktualisiert den Text-Browser basierend auf dem Toggle-Status."""
+        if ai_name not in ["Gemini", "Mistral"]:
+            return
+            
+        show_full = self.toggle_details_btn.isChecked()
+        content = self.full_responses[ai_name] if show_full else self.verdicts[ai_name]
+        
+        # HTML erst generieren, wenn wir etwas anzuzeigen haben
+        if content:
+            html_content = f"{MARKDOWN_CSS}<body>{self._markdown_to_html(content)}</body>"
+            if ai_name == "Gemini":
+                self.gemini_browser.setHtml(html_content)
+            elif ai_name == "Mistral":
+                self.mistral_browser.setHtml(html_content)
+
+    def _toggle_details(self):
+        """Wechselt zwischen Final Verdict und kompletter Analyse für beide Browser."""
+        self._update_browser_content("Gemini")
+        self._update_browser_content("Mistral")
+
 
     # ── GUI-Slot: Fehler empfangen ────────────────────────────────────────────
     def _on_error(self, ai_name: str, error_text: str):
